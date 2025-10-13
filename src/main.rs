@@ -211,6 +211,49 @@ impl Order {
     }
 }
 
+/// Represents all orders at a specific price level
+///
+/// Design Notes:
+/// - FIFO queue for time priority within the price level
+/// - SegQueue is lock-free MPMC queue from crossbeam
+/// - Cache total quantity for quick depth queries
+pub struct PriceLevel {
+    pub price: Price,
+
+    /// FIFO queue of orders at this price
+    /// Arc<Order> allows shared ownership with lookup map
+    pub orders: SegQueue<Arc<Order>>,
+
+    /// Cached total quanity at this level (for depth queries)
+    /// Updated opportunistically during matching
+    pub total_quantity: AtomicU64,
+}
+
+impl PriceLevel {
+    pub new(price: PriceLevel) -> Self {
+        Self {
+            price: price,
+            orders: SegQueue::new(),
+            total_quantity: AtomicU64::new(0),
+        }
+    }
+
+    /// Add an order to this price level
+    pub fn add_order(&self, order: Arc<Order>) {
+        // Get the current remaining quantity of the order
+        let quantity = order.get_remaining_quantity();
+        self.orders.push(order);
+        // Update the total quantity at this price level opportunistically
+        self.total_quantity.fetch_add(quantity, Ordering::Relaxed);
+    }
+
+    /// Get approximate total quantity (maybe slightly stale)
+    /// TODO: Make this more accurate
+    pub fn get_total_quantity(&self) -> Quantity {
+        self.total_quantity.load(Ordering::Relaxed)
+    }
+}
+
 fn main() {
     println!("Hello, world!");
 }
