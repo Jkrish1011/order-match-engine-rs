@@ -6,6 +6,8 @@ The engine is designed for determinism, performance, and composability. It suppo
 
 Status: active development. The intent is a full, self-contained, production-grade matching core with a clean API surface you can import as a library.
 
+This README reflects the current code in `src/main.rs` and distinguishes between what is implemented today and what is planned next.
+
 ## Table of contents
 
 - [Goals](#goals)
@@ -70,17 +72,17 @@ This repository uses battle-tested concurrent primitives:
 
 These choices provide predictable complexity and good multi-threaded performance characteristics.
 
-## Types
+## Types (implemented)
 
-Core types (some already present in `src/main.rs`):
+Defined in `src/main.rs`:
 
 - `OrderId = u64` — globally unique identifier
-- `Price = u64` — fixed-point integer; external code is responsible for scaling/formatting
+- `Price = u64` — fixed-point integer; integration layer is responsible for scaling/formatting
 - `Quantity = u64` — fixed-point integer quantity
 - `Side` — `Buy` or `Sell`
 - `OrderType` — `Limit` or `Market`
-- `OrderStatus` — `Active`, `PartiallyFilled`, `Filled`, `Cancelled`
-- `OrderBookError` — domain errors (e.g., invalid inputs, not found)
+- `OrderStatus` — `Active`, `PartiallyFilled`, `Filled`, `Cancelled` (repr as `u8`)
+- `OrderBookError` — domain errors (not yet returned from public APIs in the current snapshot)
 
 You can select a tick size and unit scaling appropriate to your instrument universe in your integration layer.
 
@@ -94,96 +96,73 @@ You can select a tick size and unit scaling appropriate to your instrument unive
 
 ## API
 
-Below is the intended ergonomic API of the engine when used as a library. Method names are indicative; minor differences may exist while development is in progress.
+Below is a snapshot of the API broken into two parts: what exists now and what is planned.
 
-### Creating an order book
+### Implemented today (in `src/main.rs`)
 
-```rust
-use match_engine_rust::{OrderBook, Side, OrderType, Price, Quantity};
+- `Order`
+  - `Order::new(order_id, side, order_type, price, quantity)` — constructs a new order with current timestamp
+  - `get_remaining_quantity()` — current remaining qty
+  - `get_status()` — current `OrderStatus`
+  - `fill(quantity)` — atomically decrements remaining quantity, updates status to `PartiallyFilled`/`Filled`, returns actual filled
+  - `cancel()` — attempts to mark as `Cancelled`; returns `true` if successful
+  - `is_active()` — `true` if `Active` or `PartiallyFilled`
 
-let mut book = OrderBook::new("BTC-USD", /*tick_size=*/ 100, /*quantity_step=*/ 1000);
-```
+- `PriceLevel`
+  - Holds FIFO queue of `Arc<Order>` and caches total quantity for quick depth queries
+  - `add_order(order: Arc<Order>)` — push to FIFO and update cached quantity
+  - `get_total_quantity()` — approximate total quantity (may be slightly stale)
 
-### Placing orders
+- `OrderBook`
+  - Internals: `bids: SkipMap<Price, Arc<PriceLevel>>`, `asks: SkipMap<Price, Arc<PriceLevel>>`, `order_lookup: DashMap<OrderId, Arc<Order>>`
+  - `OrderBook::new()` — construct an empty book
+  - `best_bid()` — highest bid price (if any)
+  - `best_ask()` — lowest ask price (if any)
+  - `spread()` — `ask - bid` if both sides exist
+  - `total_bid_quantity()` / `total_ask_quantity()` / `total_quantity()` — sums cached totals across price levels
 
-```rust
-use match_engine_rust::{NewOrder, OrderId, Side, OrderType};
+Notes:
 
-let order_id: OrderId = 1;
-let ack = book.place(NewOrder {
-    order_id,
-    side: Side::Buy,
-    order_type: OrderType::Limit,
-    price: 50_000_00,      // 50000.00 with 1/100 scaling
-    quantity: 10_000_000,  // 10.000000 with 1/1_000_000 scaling
-});
+- Public methods to place/cancel/replace orders against the book, matching logic, and public query APIs for depth/snapshots are not yet wired up in this snapshot.
+- Event types and streams are not yet exposed.
 
-assert!(ack.accepted);
-```
+### Planned (soon)
 
-For market orders, set `order_type: OrderType::Market` and `price` is ignored.
-
-### Cancelling and amending
-
-```rust
-book.cancel(order_id)?;           // Cancel by OrderId
-book.replace(order_id, 49_900_00, 8_000_000)?; // Optional replace: new price/qty
-```
-
-### Querying the book
-
-```rust
-let bbo = book.bbo();
-println!("best bid: {:?}, best ask: {:?}", bbo.bid, bbo.ask);
-
-let depth = book.depth(/*levels=*/10);
-for level in depth.bids { println!("bid @{} x{}", level.price, level.quantity); }
-for level in depth.asks { println!("ask @{} x{}", level.price, level.quantity); }
-
-let snapshot = book.snapshot(); // Full, side-sorted, stable snapshot
-```
-
-### Receiving events
-
-Every command (new, cancel, replace) results in zero or more events. Subscribe to the event stream to capture fills, partial fills, trades, cancels, and rejections.
-
-```rust
-use match_engine_rust::{Event, Trade, Fill, CancelAck};
-
-while let Some(ev) = book.next_event() {
-    match ev {
-        Event::Trade(Trade { price, quantity, maker_order_id, taker_order_id, .. }) => { /* ... */ }
-        Event::Fill(Fill { order_id, filled, remaining, .. }) => { /* ... */ }
-        Event::CancelAck(CancelAck { order_id, .. }) => { /* ... */ }
-        Event::Reject(err) => { eprintln!("rejected: {err}"); }
-        _ => {}
-    }
-}
-```
+- Public ingestion API: `place`, `cancel`, `replace`
+- Matching engine core: crossing logic for market/limit, resting logic, and FIFO priority within price levels
+- Query API: BBO struct, top-N depth, full snapshot
+- Event model: trades, fills, cancels, rejects
+- Multi-symbol orchestration (one `OrderBook` per instrument)
 
 ## Examples
 
-End-to-end toy example (limit vs. limit cross):
+Because public ingestion/matching APIs are not yet exposed, examples focus on the currently available pieces.
+
+Minimal usage of `Order`:
 
 ```rust
-use match_engine_rust::*;
+use match_engine_rust::*; // adjust to your crate path
 
-let mut book = OrderBook::new("ETH-USD", 1, 1);
+let order = Order::new(1, Side::Buy, OrderType::Limit, 10_000, 5);
+assert_eq!(order.get_remaining_quantity(), 5);
 
-// Maker adds resting ask
-book.place(NewOrder { order_id: 1, side: Side::Sell, order_type: OrderType::Limit, price: 2000, quantity: 5 });
+let filled = order.fill(3);
+assert_eq!(filled, 3);
+assert!(matches!(order.get_status(), OrderStatus::PartiallyFilled));
 
-// Taker crosses with a buy limit >= best ask
-book.place(NewOrder { order_id: 2, side: Side::Buy, order_type: OrderType::Limit, price: 2100, quantity: 3 });
+let filled2 = order.fill(10); // overfill request is clipped to remaining
+assert_eq!(filled2, 2);
+assert!(matches!(order.get_status(), OrderStatus::Filled));
+```
 
-// Consume events
-let mut traded = 0;
-while let Some(ev) = book.next_event() { if let Event::Trade(t) = ev { traded += t.quantity; } }
-assert_eq!(traded, 3);
+Read-side helpers on an empty `OrderBook`:
 
-// Remaining maker quantity
-let remaining = book.order(1).unwrap().get_remaining_quantity();
-assert_eq!(remaining, 2);
+```rust
+let book = OrderBook::new();
+assert!(book.best_bid().is_none());
+assert!(book.best_ask().is_none());
+assert!(book.spread().is_none());
+assert_eq!(book.total_quantity(), 0);
 ```
 
 ## Performance and benchmarking
@@ -224,6 +203,10 @@ cargo test
 
 ## Roadmap
 
+- Wire up public ingestion API (place/cancel/replace)
+- Implement matching (market/limit, price-time priority)
+- Depth/snapshot query API
+- Event model and stream
 - IOC/FOK time-in-force semantics
 - Iceberg orders (display vs. reserve)
 - Self-trade prevention policies

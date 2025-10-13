@@ -254,6 +254,94 @@ impl PriceLevel {
     }
 }
 
+
+/// Main order book structure
+///
+/// Architecture:
+/// - Separate skip lists for bids and asks (different sort orders to match reverse)
+/// - Skip lists maintain price ordering automatically
+/// - DashMap for O(1) order lookup by ID 
+/// - Atomic counter for generating unique order IDs.
+pub struct OrderBook {
+    /// Buy orders: Higher price = better (descending order)
+    /// Key is Price, but we will use Reverse<Price> or custom comparator
+    /// Value is Arc<PriceLevel> for shared ownership and access
+    bids: SkipMap<Price, Arc<PriceLevel>>,
+
+    /// Sell orders: Lower price = better (Ascending order)
+    /// Natural ordering works here
+    asks: SkipMap<Price, Arc<PriceLevel>>,
+
+    /// Fast lookup map: OrderId -> Arc<Order>
+    /// used for cancellations and queries
+    order_lookup: DashMap<OrderId, Arc<Order>>,
+
+    /// Atomic counter for generating unique order IDs
+    next_order_id: AtomicU64,
+}
+
+impl OrderBook {
+    /// Creates a new empty Orderbook
+    pub fn new() -> Self {
+        Self {
+            bids: SkipMap::new(),
+            asks: SkipMap::new(),
+            order_lookup: DashMap::new(),
+            next_order_id: AtomicU64::new(1),
+        }
+    }
+
+    /// Generate a unique order id.
+    fn generate_order_id(&self) -> OrderId {
+        self.next_order_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Get the best bid price (highest buy price)
+    pub fn best_bid(&self) -> Option<Price> {
+        /*
+            For bids, we want the HIGHEST price
+            SkipMap iterates in ascending order by default
+            We need to get the last entry
+        */
+        self.bids.iter().next_back().map(|entry| *entry.key())
+    }
+
+    /// Get the best ask price (lowest sell price)
+    pub fn best_ask(&self) -> Option<Price> {
+        self.asks.iter().next().map(|entry| *entry.key())
+    }
+
+    // Get current Spread
+    pub fn spread(&self) -> Option<Price> {
+        match (self.best_bid(), self.best_ask()) {
+            (Some(bid), Some(ask)) => Some(ask.saturating_sub(bid)),
+            _ => None,
+        }
+    }
+
+    /// Get total quantity at all bid levels
+    pub fn total_bid_quantity(&self) -> Quantity {
+        self.bids.iter().map(|entry| entry.value().get_total_quantity()).sum()
+    }
+
+    /// Get total quantity at all ask levels
+    pub fn total_ask_quantity(&self) -> Quantity {
+        self.asks.iter().map(|entry| entry.value().get_total_quantity()).sum()
+    }
+
+    /// Get total quantity at all levels (bids + asks)
+    pub fn total_quantity(&self) -> Quantity {
+        self.total_bid_quantity() + self.total_ask_quantity()
+    }
+}
+
+impl Default for OrderBook {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+
 fn main() {
     println!("Hello, world!");
 }
