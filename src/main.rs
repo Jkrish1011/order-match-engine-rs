@@ -173,7 +173,7 @@ impl Order {
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
-                Ok(_) -> {
+                Ok(_) => {
                     // Successflly updated remaining quantity
                     if new_remaining == 0 {
                         self.status.store(OrderStatus::Filled as u8, Ordering::Release);
@@ -230,7 +230,7 @@ pub struct PriceLevel {
 }
 
 impl PriceLevel {
-    pub new(price: PriceLevel) -> Self {
+    pub fn new(price: Price) -> Self {
         Self {
             price: price,
             orders: SegQueue::new(),
@@ -333,6 +333,32 @@ impl OrderBook {
     pub fn total_quantity(&self) -> Quantity {
         self.total_bid_quantity() + self.total_ask_quantity()
     }
+
+    /// Submit a limit order
+    pub fn submit_limit_order(
+        &self,
+        side: Side,
+        price: Price,
+        quantity: Quantity,
+    ) -> Result<OrderId, OrderBookError> {
+        todo!("Impleent limit order submissions!")
+    }
+
+    /// Submit a market order
+    /// Returns the OrderId and actual filled quantity
+    pub fn submit_market_order(
+        &self, 
+        side: Side,
+        quantity: Quantity,
+    ) -> Result<(Order, Quantity), OrderBookError> {
+        todo!("Implement market order submissions!")
+    }
+
+    /// Cancel an order by ID
+    pub fn cancel_order(&self, order_id: OrderId) -> Result<(), OrderBookError> {
+        // TODO: Implement in Phase 2
+        todo!("Implement order cancellation")
+    }
 }
 
 impl Default for OrderBook {
@@ -343,5 +369,77 @@ impl Default for OrderBook {
 
 
 fn main() {
-    println!("Hello, world!");
+    println!("Hello, This is a sample orderbook!");
+    println!("Run the testcases to see this in action");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_order_creation() {
+        let order = Order::new(1, Side::Buy, OrderType::Limit, 10_000, 100);
+        assert_eq!(order.order_id, 1);
+        assert_eq!(order.side, Side::Buy);
+        assert_eq!(order.order_type, OrderType::Limit);
+        assert_eq!(order.price, 10_000);
+        assert_eq!(order.original_quantity, 100);
+        assert_eq!(order.get_remaining_quantity(), 100);
+        assert_eq!(order.get_status(), OrderStatus::Active);
+    }
+
+    #[test]
+    fn test_order_fill() {
+        let order = Order::new(1, Side::Buy, OrderType::Limit, 10_000, 100);
+
+        // Partial Fill
+        let filled = order.fill(30);
+        assert_eq!(filled, 30);
+        assert_eq!(order.get_remaining_quantity(), 70);
+        assert_eq!(order.get_status(), OrderStatus::PartiallyFilled);
+
+        // Complete fill
+        let filled = order.fill(70);
+        assert_eq!(filled, 70);
+        assert_eq!(order.get_remaining_quantity(), 0);
+        assert_eq!(order.get_status(), OrderStatus::Filled);
+        
+        // Try to fill already filled order
+        let filled = order.fill(10);
+        assert_eq!(filled, 0);
+    }
+
+    #[test]
+    fn test_order_cancel() {
+        let order = Order::new(1, Side::Buy, OrderType::Limit, 10000, 100);
+        
+        // Cancel active order
+        assert!(order.cancel());
+        assert_eq!(order.get_status(), OrderStatus::Cancelled);
+        
+        // Try to cancel again
+        assert!(!order.cancel());
+    }
+    
+    #[test]
+    fn test_order_book_creation() {
+        let book = OrderBook::new();
+        assert_eq!(book.best_bid(), None);
+        assert_eq!(book.best_ask(), None);
+        assert_eq!(book.spread(), None);
+    }
+    
+    #[test]
+    fn test_order_id_generation() {
+        let book = OrderBook::new();
+        let id1 = book.generate_order_id();
+        let id2 = book.generate_order_id();
+        let id3 = book.generate_order_id();
+        
+        assert_eq!(id1, 1);
+        assert_eq!(id2, 2);
+        assert_eq!(id3, 3);
+    }
+
 }
