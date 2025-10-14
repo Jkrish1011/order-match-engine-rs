@@ -9,6 +9,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH}
 };
 use thiserror::Error;
+use std::cmp::min;
 
 // Unique Identifier for each order (globally unique)
 pub type OrderId = u64;
@@ -341,7 +342,78 @@ impl OrderBook {
         price: Price,
         quantity: Quantity,
     ) -> Result<OrderId, OrderBookError> {
-        todo!("Impleent limit order submissions!")
+        if price == 0 {
+            return Err(OrderBookError::InvalidPrice(price));
+        }
+
+        if quantity <= 0 {
+            return Err(OrderBookError::InvalidQuantity(quantity));
+        }
+
+        let order_id = self.generate_order_id();
+        let order = Arc::new(Order::new(order_id, side, OrderType::Limit, price, quantity));
+
+        let opposite_side = match side {
+            Side::Buy => {
+                &self.asks
+            }
+            Side::Sell => {
+                &self.bids
+            }
+        };
+
+        for entry in opposite_side.iter() {
+            let price = *entry.key();
+            let price_level: &Arc<PriceLevel> = entry.value();
+            loop {
+                match price_level.orders.pop() {
+                    Some(resting_order) => {
+                        if !resting_order.is_active() {
+                            // Not active. Remove from adding it back to the orderbook.
+                            // Lazy cleanup.
+                            continue;
+                        }
+
+                        let match_quantity = min(
+                            order.get_remaining_quantity(),
+                            resting_order.get_remaining_quantity()
+                        );
+
+                        // Execute the match
+                        resting_order.fill(match_quantity);
+                        order.fill(match_quantity);
+                        
+                        if resting_order.get_remaining_quantity() > 0 {
+                            price_level.orders.push(resting_order);
+                        }
+
+                        if order.get_remaining_quantity() == 0 {
+                            break;
+                        }
+                    }
+                    None => {
+                        // Price level exhausted
+                        break;
+                    }
+                }
+
+                if price_level.orders.is_empty() {
+                    opposite_side.remove(&price_level.price);
+                }
+
+                if order.get_remaining_quantity() == 0 {
+                    break; // Fully matched
+                }
+            }
+
+            // Update the orderbook
+            if order.get_remaining_quantity() > 0 {
+                opposite_side.insert(price_level.price, price_level.clone());
+            }
+
+
+        }
+        Ok(order_id)
     }
 
     /// Submit a market order
@@ -442,4 +514,21 @@ mod tests {
         assert_eq!(id3, 3);
     }
 
+    #[test]
+    fn test_end_to_end_orderbook() {
+        let orderbook = OrderBook::new();
+        let order = Order::new(1, Side::Buy, OrderType::Limit, 10_000, 100);
+        orderbook.submit_limit_order(Side::Buy, 10_000, 100);
+        
+        let buy_order = Order::new(2, Side::Buy, OrderType::Limit, 10_000, 100);
+        let sell_order = Order::new(3, Side::Sell, OrderType::Limit, 10_000, 100);
+
+        orderbook.submit_limit_order(Side::Buy, 10_000, 100);
+        orderbook.submit_limit_order(Side::Sell, 10_000, 100);
+        
+        println!("Spread : {}", orderbook.spread().unwrap());
+        // assert_eq!(orderbook.spread(), Some(0));
+        // assert_eq!(orderbook.best_bid(), Some(10_000));
+        // assert_eq!(orderbook.best_ask(), Some(10_000));
+    }
 }
