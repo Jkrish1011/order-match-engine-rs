@@ -4,10 +4,12 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+crossbeam-channel = "0.5.15"
 crossbeam-epoch = "0.9.18"
 crossbeam-queue = "0.3.12"
 crossbeam-skiplist = "0.1.3"
 dashmap = "6.1.0"
+parking_lot = "0.12.5"
 thiserror = "2.0.17"
 
 [dev-dependencies]

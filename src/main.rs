@@ -1,85 +1,22 @@
-use crossbeam_queue::SegQueue;
 use crossbeam_skiplist::SkipMap;
 use dashmap::DashMap;
 use std::{
-    sync::{
+    collections::{BTreeMap, VecDeque}, sync::{
         atomic::{AtomicU64, AtomicU8, Ordering}, 
         Arc
-    },
-    time::{SystemTime, UNIX_EPOCH}
+    }, thread::current, time::{SystemTime, UNIX_EPOCH}
 };
 use thiserror::Error;
 use std::cmp::min;
+use parking_lot::{Mutex, RwLock};
+use crossbeam_channel::{unbounded, Sender};
 
-// Unique Identifier for each order (globally unique)
-pub type OrderId = u64;
+mod types;
+mod events;
 
-// Price represented as fixed-point integer.
-pub type Price = u64;
+use types::*;
+use events::*;
 
-// Quantity of the asset
-pub type Quantity = u64;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Side {
-    Buy,
-    Sell,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OrderType {
-    Limit,
-    Market,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
-pub enum OrderStatus {
-    Active = 0,
-    PartiallyFilled = 1, 
-    Filled = 2,
-    Cancelled = 3,
-}
-
-impl From<u8> for OrderStatus {
-    fn from(value: u8) -> Self {
-        match value {
-            0 => OrderStatus::Active,
-            1 => OrderStatus::PartiallyFilled,
-            2 => OrderStatus::Filled,
-            3 => OrderStatus::Cancelled,
-            _ => OrderStatus::Active, // Default fallback!
-        }
-    }
-}
-
-#[derive(Error, Debug)]
-pub enum OrderBookError {
-    #[error("Order not found: {0}")]
-    OrderNotFound(OrderId),
-    
-    #[error("Invalid price: {0}")]
-    InvalidPrice(Price),
-    
-    #[error("Invalid quantity: {0}")]
-    InvalidQuantity(Quantity),
-    
-    #[error("Order already cancelled: {0}")]
-    AlreadyCancelled(OrderId),
-    
-    #[error("Market order cannot be placed in empty book")]
-    EmptyBook,
-}
-
-#[derive(Debug)]
-struct Bid {
-
-}
-
-#[derive(Debug)]
-struct Ask {
-
-}
 
 /// Represents a single order in the order book
 ///
@@ -126,7 +63,7 @@ impl Order {
         price: Price,
         quantity: Quantity,
     ) -> Self {
-        let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64;
+        let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
 
         Self {
             order_id,
@@ -194,15 +131,30 @@ impl Order {
 
     /// Cancel the order
     /// Returns true if cancel is successful, else false if already filled/cancelled.
+    /// This is done in an atomic manner.
     pub fn cancel(&self) -> bool {
-        let current_status = self.status.load(Ordering::Acquire);
+        let mut current_status = self.status.load(Ordering::Acquire);
 
-        if current_status == OrderStatus::Filled as u8 || current_status == OrderStatus::Cancelled as u8 {  
-            return false;
+        loop {
+            if current_status == OrderStatus::Filled as u8 || current_status == OrderStatus::Cancelled as u8 {
+                return false;
+            }
+
+            match self.status.compare_exchange_weak(
+                current_status,
+                OrderStatus::Cancelled as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire
+            ) {
+                Ok(_) => {
+                    // Successfully updated status
+                    return true;
+                }
+                Err(actual) => {
+                    current_status = actual;
+                }
+            }
         }
-
-        self.status.store(OrderStatus::Cancelled as u8, Ordering::Release);
-        true
     }
 
     /// Checks if the order is still active (not filled or cancelled)
@@ -216,14 +168,14 @@ impl Order {
 ///
 /// Design Notes:
 /// - FIFO queue for time priority within the price level
-/// - SegQueue is lock-free MPMC queue from crossbeam
+/// - Mutex for thread safety and VecDeque for FIFO queue
 /// - Cache total quantity for quick depth queries
 pub struct PriceLevel {
     pub price: Price,
 
     /// FIFO queue of orders at this price
     /// Arc<Order> allows shared ownership with lookup map
-    pub orders: SegQueue<Arc<Order>>,
+    pub orders: Mutex<VecDeque<Arc<Order>>>,
 
     /// Cached total quanity at this level (for depth queries)
     /// Updated opportunistically during matching
@@ -234,24 +186,61 @@ impl PriceLevel {
     pub fn new(price: Price) -> Self {
         Self {
             price: price,
-            orders: SegQueue::new(),
+            orders: Mutex::new(VecDeque::new()),
             total_quantity: AtomicU64::new(0),
         }
     }
 
     /// Add an order to this price level
-    pub fn add_order(&self, order: Arc<Order>) {
+    pub fn push_order(&self, order: Arc<Order>) {
         // Get the current remaining quantity of the order
+        let vecDeque = &mut *self.orders.lock();
         let quantity = order.get_remaining_quantity();
-        self.orders.push(order);
+        vecDeque.push_back(order);
         // Update the total quantity at this price level opportunistically
-        self.total_quantity.fetch_add(quantity, Ordering::Relaxed);
+        self.total_quantity.fetch_add(quantity, Ordering::AcqRel);
     }
+
+    /// Pop the front order from this price level
+    pub fn pop_front(&self) -> Option<Arc<Order>> {
+        let vecDeque = &mut *self.orders.lock();
+        let order =vecDeque.pop_front();
+        order
+    }
+
+    pub fn remove_order(&self, order_id: OrderId) -> Option<Quantity> {
+        let vecDeque = &mut *self.orders.lock();
+
+        let mut remaining_quantity: Option<Quantity> = None;
+        let mut i: usize = 0;
+        while i < vecDeque.len() {
+            if vecDeque[i].order_id == order_id {
+                let curr_order = vecDeque.remove(i).unwrap();
+                let curr_remaining_q = curr_order.get_remaining_quantity();
+                remaining_quantity = Some(curr_remaining_q);
+                break;
+            }
+
+            i+=1;
+        }
+
+        // Subtract the remaining quantity from the total quantity
+        if let Some(rem) = remaining_quantity {
+            self.total_quantity.fetch_sub(rem, Ordering::AcqRel);
+        }
+
+        return remaining_quantity
+    }   
 
     /// Get approximate total quantity (maybe slightly stale)
     /// TODO: Make this more accurate
     pub fn get_total_quantity(&self) -> Quantity {
-        self.total_quantity.load(Ordering::Relaxed)
+        self.total_quantity.load(Ordering::AcqRel)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        let vecDeque = &mut *self.orders.lock();
+        vecDeque.is_empty()
     }
 }
 
@@ -418,12 +407,80 @@ impl OrderBook {
 
     /// Submit a market order
     /// Returns the OrderId and actual filled quantity
+    /// Market orders will be filled at the best available price and do not enter the orderbook.
     pub fn submit_market_order(
         &self, 
         side: Side,
         quantity: Quantity,
-    ) -> Result<(Order, Quantity), OrderBookError> {
-        todo!("Implement market order submissions!")
+    ) -> Result<(OrderId, Quantity), OrderBookError> {
+        if quantity <= 0 {
+            return Err(OrderBookError::InvalidQuantity(quantity));
+        }
+
+        let opposite_side = match side {
+            Side::Buy => &self.asks,
+            Side::Sell => &self.bids,
+        };
+
+        if opposite_side.is_empty() {
+            return Err(OrderBookError::EmptyBook);
+        }
+
+        let order_id = self.generate_order_id();
+        let order = Arc::new(Order::new(order_id, side, OrderType::Market, 0, quantity));
+
+        let iter: Box<dyn Iterator<Item = _> + '_> = match side {
+            Side::Buy => Box::new(opposite_side.iter()), // Ascending for asks.
+            Side::Sell => Box::new(opposite_side.iter().rev()) // Descending for bids.
+        };
+
+        for entry in iter {
+            let price = *entry.key();
+            let price_level: &Arc<PriceLevel> = entry.value();
+
+            loop {
+                match price_level.orders.pop() {
+                    Some(resting_order) => {
+                        if !resting_order.is_active() {
+                            // Not active. Remove from adding it back to the orderbook.
+                            // Lazy cleanup.
+                            continue;
+                        }
+
+                        let match_quantity = min(
+                            order.get_remaining_quantity(),
+                            resting_order.get_remaining_quantity()
+                        );
+
+                        // Execute the match
+                        resting_order.fill(match_quantity);
+                        order.fill(match_quantity);
+                        
+                        if resting_order.get_remaining_quantity() > 0 {
+                            price_level.orders.push(resting_order);
+                        }
+
+                        if order.get_remaining_quantity() == 0 {
+                            break;
+                        }
+                    }
+                    None => {
+                        // Price level exhausted
+                        break;
+                    }
+                }
+
+                if order.get_remaining_quantity() == 0 {
+                    break; // Fully matched
+                }
+            }
+
+            
+        }
+
+        Ok((order_id, 0 as u64))
+
+
     }
 
     /// Cancel an order by ID
@@ -526,7 +583,7 @@ mod tests {
         orderbook.submit_limit_order(Side::Buy, 10_000, 100);
         orderbook.submit_limit_order(Side::Sell, 10_000, 100);
         
-        println!("Spread : {}", orderbook.spread().unwrap());
+        orderbook.spread();
         // assert_eq!(orderbook.spread(), Some(0));
         // assert_eq!(orderbook.best_bid(), Some(10_000));
         // assert_eq!(orderbook.best_ask(), Some(10_000));
