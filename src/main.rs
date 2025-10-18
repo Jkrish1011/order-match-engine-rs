@@ -256,28 +256,31 @@ pub struct OrderBook {
     /// Buy orders: Higher price = better (descending order)
     /// Key is Price, but we will use Reverse<Price> or custom comparator
     /// Value is Arc<PriceLevel> for shared ownership and access
-    bids: SkipMap<Price, Arc<PriceLevel>>,
+    bids: RwLock<BTreeMap<Price, Arc<PriceLevel>>>,
 
     /// Sell orders: Lower price = better (Ascending order)
     /// Natural ordering works here
-    asks: SkipMap<Price, Arc<PriceLevel>>,
+    asks: RwLock<BTreeMap<Price, Arc<PriceLevel>>>,
 
-    /// Fast lookup map: OrderId -> Arc<Order>
-    /// used for cancellations and queries
-    order_lookup: DashMap<OrderId, Arc<Order>>,
+    /// Fast lookup map: OrderId -> (Side, Price) to PriceLevel a bit faster
+    order_lookup: DashMap<OrderId, (Side, Price)>,
 
     /// Atomic counter for generating unique order IDs
     next_order_id: AtomicU64,
+
+    /// Trade receiver for events
+    trade_tx: Sender<Trade>
 }
 
 impl OrderBook {
     /// Creates a new empty Orderbook
-    pub fn new() -> Self {
+    pub fn new(trade_tx: Sender<Trade>) -> Self {
         Self {
-            bids: SkipMap::new(),
-            asks: SkipMap::new(),
+            bids: RwLock::new(BTreeMap::new()),
+            asks: RwLock::new(BTreeMap::new()),
             order_lookup: DashMap::new(),
             next_order_id: AtomicU64::new(1),
+            trade_tx: trade_tx,
         }
     }
 
@@ -324,6 +327,26 @@ impl OrderBook {
         self.total_bid_quantity() + self.total_ask_quantity()
     }
 
+
+    fn get_or_create_level(map_lock: &RwLock<BTreeMap<Price, Arc<PriceLevel>>>, price: Price) -> Arc<PriceLevel> {
+        {
+            let map = map_lock.read();
+            if let Some(level) = map.get(&price) {
+                return level.clone();
+            }
+        }
+
+        // Upgrade: take write lock and insert if missing.
+        let mut map = map_lock.write();
+        if let Some(level) = map.get(&price) {
+            level.clone()
+        } else {
+            let level = Arc::new(PriceLevel::new(price));
+            map.insert(price, level.clone());
+            level
+        }
+    }
+
     /// Submit a limit order
     pub fn submit_limit_order(
         &self,
@@ -342,67 +365,123 @@ impl OrderBook {
         let order_id = self.generate_order_id();
         let order = Arc::new(Order::new(order_id, side, OrderType::Limit, price, quantity));
 
-        let opposite_side = match side {
+       // taker matches against the opposite orderbook
+       match side {
             Side::Buy => {
-                &self.asks
-            }
-            Side::Sell => {
-                &self.bids
-            }
-        };
+                let asks_read = self.asks.read();
+                let mut candidate_prices: Vec<Price> = asks_read.range(..=price).map(|(p, _) | *p).collect();
+                drop(asks_read);
 
-        for entry in opposite_side.iter() {
-            let price = *entry.key();
-            let price_level: &Arc<PriceLevel> = entry.value();
-            loop {
-                match price_level.orders.pop() {
-                    Some(resting_order) => {
-                        if !resting_order.is_active() {
-                            // Not active. Remove from adding it back to the orderbook.
-                            // Lazy cleanup.
+                for level_price in candidate_prices {
+                    let level_opt = {
+                        let asks = self.asks.read();
+                        asks.get(&level_price).cloned()
+                    };
+
+                    if level_opt.is_none() {
+                        continue;
+                    }
+
+                    let level = level_opt.unwrap();
+
+                    // Lock the price level's queue and process FIFO manner.
+                    loop {
+                        // pop and try to fill
+                        let maybe_maker = {
+                            let mut q = level.orders.lock();
+                            q.pop_front()
+                        };
+
+                        let maker = match maybe_maker {
+                            Some(m_order) => m_order,
+                            None => break,
+                        };
+
+                        // If the current order is not active, subtract remaining and continue
+                        // Lazy cleanup.
+                        if !matches!(maker.get_status(), OrderStatus::Active | OrderStatus::PartiallyFilled) {
+                            let rem = maker.get_remaining_quantity();
+                            level.total_quantity.fetch_sub(rem, Ordering::AcqRel);
                             continue;
                         }
 
-                        let match_quantity = min(
-                            order.get_remaining_quantity(),
-                            resting_order.get_remaining_quantity()
-                        );
-
-                        // Execute the match
-                        resting_order.fill(match_quantity);
-                        order.fill(match_quantity);
-                        
-                        if resting_order.get_remaining_quantity() > 0 {
-                            price_level.orders.push(resting_order);
+                        // Compute Match quantity
+                        let taker_left = order.get_remaining_quantity();
+                        if taker_left == 0 {
+                            // push maker back to front? No — we popped it and must reinsert since taker didn't consume it
+                            // but we intentionally popped it; since we haven't filled it, we should push_front to preserve FIFO:
+                            let mut q = level.orders.lock();
+                            q.push_front(maker.clone());
+                            break;
                         }
 
+                        let maker_left = maker.get_remaining_quantity();
+                        let requested = min(taker_left, maker_left);
+                        if requested == 0 {
+                            continue;
+                        }
+
+                        // Execute fills
+                        let filled_maker = maker.fill(requested);
+
+                        if filled_maker == 0 {
+                            // Another thread would have filled it. Continue to the next one.
+                            continue;
+                        }
+
+                        level.total_quantity.fetch_sub(filled_maker, Ordering::AcqRel);
+
+                        let filled_taker = order.fill(filled_maker);
+                        // Emit trade event
+                        let trade = Trade {
+                            taker_order_id: order_id,
+                            maker_order_id: maker.order_id,
+                            price: level.price,
+                            quantity: filled_taker,
+                            timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64,
+                        };
+
+                        let _ = self.trade_tx.send(trade);
+
+                        if maker.get_remaining_quantity() > 0 {
+                            let mut q = level.orders.lock();
+                            q.push_front(maker);
+                        }
+
+                        // If taker is fully filled, break
                         if order.get_remaining_quantity() == 0 {
                             break;
                         }
                     }
-                    None => {
-                        // Price level exhausted
+
+                    // After finishing the level, remove it if that level is empty.
+                    if level.is_empty() {
+                        let mut asks = self.asks.write();
+                        if let Some(existing) = asks.get(&level_price) {
+                            if Arc::ptr_eq(existing, &level) && existing.is_empty() {
+                                asks.remove(&level_price);
+                            }
+                        }
+                    }
+
+                    if order.get_remaining_quantity() == 0 {
                         break;
                     }
                 }
 
-                if price_level.orders.is_empty() {
-                    opposite_side.remove(&price_level.price);
+                // If remaining, insert into bids
+                if order.get_remaining_quantity() > 0 {
+                    let level = Self::get_or_create_level(&self.bids, price);
+                    level.push_order(order.clone());
+                    self.order_lookup.insert(order_id, (side, price));
                 }
+            },
+            Side::Sell => {
+                
 
-                if order.get_remaining_quantity() == 0 {
-                    break; // Fully matched
-                }
             }
-
-            // Update the orderbook
-            if order.get_remaining_quantity() > 0 {
-                opposite_side.insert(price_level.price, price_level.clone());
-            }
-
-
-        }
-        Ok(order_id)
+       }
+       Ok(10)
     }
 
     /// Submit a market order
