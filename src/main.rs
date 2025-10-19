@@ -314,7 +314,8 @@ impl OrderBook {
 
     /// Get total quantity at all bid levels
     pub fn total_bid_quantity(&self) -> Quantity {
-        self.bids.iter().map(|entry| entry.value().get_total_quantity()).sum()
+        let bids = self.bids.read();
+        bids.iter().map(|entry| entry.get_total_quantity()).sum()
     }
 
     /// Get total quantity at all ask levels
@@ -477,11 +478,104 @@ impl OrderBook {
                 }
             },
             Side::Sell => {
-                
+                // Symmetric. But read through bids in descending order
+                let bids_read = self.bids.read();
+                let mut candidate_prices: Vec<Price> = bids_read.keys().cloned().collect();
+                drop(bids_read);
 
+                candidate_prices.sort_by(|a,b| b.cmp(a)); // sort in descending order
+
+                for level_price in candidate_prices {
+                    let level_opt = {
+                        let bids = self.bids.read();
+                        bids.get(&level_price).cloned()
+                    };
+
+                    if level_opt.is_none() {
+                        continue;
+                    }
+
+                    let level = level_opt.unwrap();
+
+                    loop {
+
+                        let maybe_maker = {
+                            let mut q = level.orders.lock();
+                            q.pop_front()
+                        };
+
+                        let maker = match maybe_maker {
+                            Some(m) => m,
+                            None => break
+                        };
+
+                        if !matches!(maker.get_status(), OrderStatus::Active | OrderStatus::PartiallyFilled ){
+                            let rem = maker.get_remaining_quantity();
+                            level.total_quantity.fetch_sub(rem, Ordering::AcqRel);
+                            continue;
+                        }
+
+                        let taker_left = order.get_remaining_quantity();
+                        if taker_left == 0 {
+                            let mut q = level.orders.lock();
+                            q.push_front(maker.clone());
+                            continue;
+                        }
+
+                        let maker_left = maker.get_remaining_quantity();
+                        let requested = min(taker_left, maker_left);
+                        if requested == 0 { 
+                            continue; 
+                        }
+
+                        let filled_maker = maker.fill(requested);
+                        if filled_maker == 0 {
+                            continue;
+                        }
+
+                        level.total_quantity.fetch_sub(filled_maker, Ordering::AcqRel);
+                        let filled_taker = order.fill(filled_maker);
+
+                        let trade = Trade {
+                            taker_order_id: order_id,
+                            maker_order_id: maker.order_id,
+                            price: level.price, 
+                            quantity: filled_taker,
+                            timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64,
+                        };
+
+                        let _ = self.trade_tx.send(trade);
+
+                        if maker.get_remaining_quantity() > 0 {
+                            let mut q = level.orders.lock();
+                            q.push_front(maker);
+                        }
+                        if order.get_remaining_quantity() == 0 {
+                            break;
+                        }
+                    }
+
+                    if level.is_empty() {
+                        let mut bids = self.bids.write();
+                        if let Some(existing) = bids.get(&level_price) {
+                            if Arc::ptr_eq(existing, &level) && existing.is_empty() {
+                                bids.remove(&level_price);
+                            }
+                        }
+                    }
+                    if order.get_remaining_quantity() == 0 { 
+                        break; 
+                    }
+                }
+
+                if order.get_remaining_quantity() > 0 {
+                    let level = Self::get_or_create_level(&self.asks, price);
+                    level.push_order(order.clone());
+                    self.order_lookup.insert(order_id, (side, price));
+                }
             }
        }
-       Ok(10)
+       Ok(order_id)
     }
 
     /// Submit a market order
