@@ -293,15 +293,16 @@ impl OrderBook {
     pub fn best_bid(&self) -> Option<Price> {
         /*
             For bids, we want the HIGHEST price
-            SkipMap iterates in ascending order by default
             We need to get the last entry
         */
-        self.bids.iter().next_back().map(|entry| *entry.key())
+        let bids = self.bids.read();
+        bids.iter().next_back().map(|entry| entry.1.price)
     }
 
     /// Get the best ask price (lowest sell price)
     pub fn best_ask(&self) -> Option<Price> {
-        self.asks.iter().next().map(|entry| *entry.key())
+        let asks = self.asks.read();
+        asks.iter().next().map(|entry| entry.1.price)
     }
 
     // Get current Spread
@@ -315,12 +316,13 @@ impl OrderBook {
     /// Get total quantity at all bid levels
     pub fn total_bid_quantity(&self) -> Quantity {
         let bids = self.bids.read();
-        bids.iter().map(|entry| entry.get_total_quantity()).sum()
+        bids.iter().map(|entry| entry.1.get_total_quantity()).sum()
     }
 
     /// Get total quantity at all ask levels
     pub fn total_ask_quantity(&self) -> Quantity {
-        self.asks.iter().map(|entry| entry.value().get_total_quantity()).sum()
+        let asks = self.asks.read();
+        asks.iter().map(|entry| entry.1.get_total_quantity()).sum()
     }
 
     /// Get total quantity at all levels (bids + asks)
