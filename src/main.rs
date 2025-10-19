@@ -235,7 +235,7 @@ impl PriceLevel {
     /// Get approximate total quantity (maybe slightly stale)
     /// TODO: Make this more accurate
     pub fn get_total_quantity(&self) -> Quantity {
-        self.total_quantity.load(Ordering::AcqRel)
+        self.total_quantity.load(Ordering::Relaxed)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -592,82 +592,203 @@ impl OrderBook {
             return Err(OrderBookError::InvalidQuantity(quantity));
         }
 
-        let opposite_side = match side {
-            Side::Buy => &self.asks,
-            Side::Sell => &self.bids,
-        };
-
-        if opposite_side.is_empty() {
-            return Err(OrderBookError::EmptyBook);
-        }
-
         let order_id = self.generate_order_id();
         let order = Arc::new(Order::new(order_id, side, OrderType::Market, 0, quantity));
+        let mut filled_total: Quantity = 0;
 
-        let iter: Box<dyn Iterator<Item = _> + '_> = match side {
-            Side::Buy => Box::new(opposite_side.iter()), // Ascending for asks.
-            Side::Sell => Box::new(opposite_side.iter().rev()) // Descending for bids.
-        };
+        match side {
+            Side::Buy => {
+                // walk asks ascending
+                let asks_read = self.asks.read();
+                let mut candidate_prices: Vec<Price> = asks_read.keys().cloned().collect();
+                drop(asks_read);
 
-        for entry in iter {
-            let price = *entry.key();
-            let price_level: &Arc<PriceLevel> = entry.value();
+                candidate_prices.sort(); // ascending
+                for level_price in candidate_prices {
+                    let level_opt = {
+                        let asks = self.asks.read();
+                        asks.get(&level_price).cloned()
+                    };
+                    if level_opt.is_none() { 
+                        continue; 
+                    }
+                    let level = level_opt.unwrap();
 
-            loop {
-                match price_level.orders.pop() {
-                    Some(resting_order) => {
-                        if !resting_order.is_active() {
-                            // Not active. Remove from adding it back to the orderbook.
-                            // Lazy cleanup.
+                    loop {
+                        let maybe_maker = { 
+                            let mut q = level.orders.lock(); 
+                            q.pop_front() 
+                        };
+
+                        let maker = match maybe_maker { 
+                            Some(m) => m, 
+                            None => break 
+                        };
+
+                        if !matches!(maker.get_status(), OrderStatus::Active | OrderStatus::PartiallyFilled) {
+                            let rem = maker.get_remaining_quantity();
+                            level.total_quantity.fetch_sub(rem, Ordering::AcqRel);
                             continue;
                         }
+                        let maker_left = maker.get_remaining_quantity();
 
-                        let match_quantity = min(
-                            order.get_remaining_quantity(),
-                            resting_order.get_remaining_quantity()
-                        );
-
-                        // Execute the match
-                        resting_order.fill(match_quantity);
-                        order.fill(match_quantity);
-                        
-                        if resting_order.get_remaining_quantity() > 0 {
-                            price_level.orders.push(resting_order);
+                        if maker_left == 0 { 
+                            continue; 
                         }
-
-                        if order.get_remaining_quantity() == 0 {
+                        let taker_left = order.get_remaining_quantity();
+                        if taker_left == 0 {
+                            let mut q = level.orders.lock();
+                            q.push_front(maker.clone());
                             break;
                         }
+                        let requested = min(taker_left, maker_left);
+                        let filled_maker = maker.fill(requested);
+
+                        if filled_maker == 0 { 
+                            continue; 
+                        }
+                        level.total_quantity.fetch_sub(filled_maker, Ordering::AcqRel);
+                        let filled_taker = order.fill(filled_maker);
+                        filled_total += filled_taker;
+
+                        let trade = Trade {
+                            taker_order_id: order_id,
+                            maker_order_id: maker.order_id,
+                            price: level.price,
+                            quantity: filled_taker,
+                            timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64,
+                        };
+                        let _ = self.trade_tx.send(trade);
+
+                        if maker.get_remaining_quantity() > 0 {
+                            let mut q = level.orders.lock();
+                            q.push_front(maker);
+                        }
+                        if order.get_remaining_quantity() == 0 { break; }
                     }
-                    None => {
-                        // Price level exhausted
-                        break;
-                    }
+                    if order.get_remaining_quantity() == 0 { break; }
                 }
 
-                if order.get_remaining_quantity() == 0 {
-                    break; // Fully matched
-                }
+                // Market orders NEVER go into book, simply return filled_total
             }
 
-            
+            Side::Sell => {
+                // symmetric: process bids in descending order
+                let bids_read = self.bids.read();
+                let mut candidate_prices: Vec<Price> = bids_read.keys().cloned().collect();
+                drop(bids_read);
+                candidate_prices.sort_by(|a,b| b.cmp(a)); // descending
+
+                for level_price in candidate_prices {
+                    let level_opt = {
+                        let bids = self.bids.read();
+                        bids.get(&level_price).cloned()
+                    };
+
+                    if level_opt.is_none() { 
+                        continue; 
+                    }
+                    let level = level_opt.unwrap();
+
+                    loop {
+                        let maybe_maker = { 
+                            let mut q = level.orders.lock(); 
+                            q.pop_front() 
+                        };
+                        
+                        let maker = match maybe_maker { 
+                            Some(m) => m, 
+                            None => break 
+                        };
+
+                        if !matches!(maker.get_status(), OrderStatus::Active | OrderStatus::PartiallyFilled) {
+                            let rem = maker.get_remaining_quantity();
+                            level.total_quantity.fetch_sub(rem, Ordering::AcqRel);
+                            continue;
+                        }
+                        let maker_left = maker.get_remaining_quantity();
+
+                        if maker_left == 0 { 
+                            continue; 
+                        }
+                        let taker_left = order.get_remaining_quantity();
+                        if taker_left == 0 {
+                            let mut q = level.orders.lock();
+                            q.push_front(maker.clone());
+                            break;
+                        }
+                        let requested = min(taker_left, maker_left);
+                        let filled_maker = maker.fill(requested);
+
+                        if filled_maker == 0 { 
+                            continue; 
+                        }
+                        level.total_quantity.fetch_sub(filled_maker, Ordering::AcqRel);
+                        let filled_taker = order.fill(filled_maker);
+                        filled_total += filled_taker;
+                        let trade = Trade {
+                            taker_order_id: order_id,
+                            maker_order_id: maker.order_id,
+                            price: level.price,
+                            quantity: filled_taker,
+                            timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64,
+                        };
+                        let _ = self.trade_tx.send(trade);
+                        if maker.get_remaining_quantity() > 0 {
+                            let mut q = level.orders.lock();
+                            q.push_front(maker);
+                        }
+                        if order.get_remaining_quantity() == 0 { break; }
+                    }
+                    if order.get_remaining_quantity() == 0 { break; }
+                }
+            }
         }
 
-        Ok((order_id, 0 as u64))
-
-
+        Ok((order_id, filled_total))
     }
 
-    /// Cancel an order by ID
-    pub fn cancel_order(&self, order_id: OrderId) -> Result<(), OrderBookError> {
-        // TODO: Implement in Phase 2
-        todo!("Implement order cancellation")
-    }
-}
 
-impl Default for OrderBook {
-    fn default() -> Self {
-        Self::new()
+    // Cancel an order by id. Deterministic and safe.
+    /// Returns Ok(remaining_qty) if cancelled; Err if not found / already filled.
+    pub fn cancel_order(&self, order_id: OrderId) -> Result<Quantity, String> {
+        // Find order meta in lookup
+        if let Some(entry) = self.order_lookup.get(&order_id) {
+            let (side, price) = *entry.value();
+            // Get PriceLevel
+            let maybe_level = {
+                match side {
+                    Side::Buy => self.bids.read().get(&price).cloned(),
+                    Side::Sell => self.asks.read().get(&price).cloned(),
+                }
+            };
+
+            if let Some(level) = maybe_level {
+                // Attempt atomic cancel of status first
+                // But we must remove from queue to prevent matching
+                // coord: perform cancel atomic, then remove from queue
+                // We'll try to fetch the order object via scanning queue and compare id.
+                // If other thread is filling simultaneously, cancel_atomic might fail; handle that.
+                // Acquire queue lock and locate/remove
+                let removed = level.remove_order(order_id);
+                if let Some(rem_qty) = removed {
+                    // mark status (best-effort)
+                    // Try to set status to Cancelled if not already Filled
+                    // We cannot fetch order object easily here; but we can attempt to set in lookup map?
+                    // For simplicity, get the order object from elsewhere: the caller should also maintain pointer to Arc<Order>.
+                    // We can find Arc<Order> by scanning or you persisted a pointer elsewhere.
+                    // In this simplified design we return remaining qty removed and remove lookup entry.
+                    self.order_lookup.remove(&order_id);
+                    return Ok(rem_qty);
+                } else {
+                    return Err("Order not found in price level queue (maybe already matched)".into());
+                }
+            } else {
+                return Err("Price level not found".into());
+            }
+        } else {
+            return Err("Order not found".into());
+        }
     }
 }
 
