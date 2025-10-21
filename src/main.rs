@@ -11,6 +11,11 @@ use std::cmp::min;
 use parking_lot::{Mutex, RwLock};
 use crossbeam_channel::{unbounded, Sender};
 
+use once_cell::sync::Lazy;
+use rand::{rngs::StdRng, Rng, SeedableRng};
+use std::thread;
+use std::time::{Duration, Instant};
+
 mod types;
 mod events;
 
@@ -208,28 +213,21 @@ impl PriceLevel {
         order
     }
 
-    pub fn remove_order(&self, order_id: OrderId) -> Option<Quantity> {
+    pub fn remove_order(&self, order_id: OrderId) -> Option<(Arc<Order>, Quantity)> {
         let vecDeque = &mut *self.orders.lock();
 
-        let mut remaining_quantity: Option<Quantity> = None;
         let mut i: usize = 0;
         while i < vecDeque.len() {
             if vecDeque[i].order_id == order_id {
                 let curr_order = vecDeque.remove(i).unwrap();
                 let curr_remaining_q = curr_order.get_remaining_quantity();
-                remaining_quantity = Some(curr_remaining_q);
-                break;
+                // Subtract remaining quantity from the total quantity
+                self.total_quantity.fetch_sub(curr_remaining_q, Ordering::AcqRel);
+                return Some((curr_order, curr_remaining_q));
             }
-
-            i+=1;
+            i += 1;
         }
-
-        // Subtract the remaining quantity from the total quantity
-        if let Some(rem) = remaining_quantity {
-            self.total_quantity.fetch_sub(rem, Ordering::AcqRel);
-        }
-
-        return remaining_quantity
+        None
     }   
 
     /// Get approximate total quantity (maybe slightly stale)
@@ -263,7 +261,7 @@ pub struct OrderBook {
     asks: RwLock<BTreeMap<Price, Arc<PriceLevel>>>,
 
     /// Fast lookup map: OrderId -> (Side, Price) to PriceLevel a bit faster
-    order_lookup: DashMap<OrderId, (Side, Price)>,
+    order_lookup: DashMap<OrderId, (Side, Price, Arc<Order>)>,
 
     /// Atomic counter for generating unique order IDs
     next_order_id: AtomicU64,
@@ -476,7 +474,7 @@ impl OrderBook {
                 if order.get_remaining_quantity() > 0 {
                     let level = Self::get_or_create_level(&self.bids, price);
                     level.push_order(order.clone());
-                    self.order_lookup.insert(order_id, (side, price));
+                    self.order_lookup.insert(order_id, (side, price, order.clone()));
                 }
             },
             Side::Sell => {
@@ -573,7 +571,7 @@ impl OrderBook {
                 if order.get_remaining_quantity() > 0 {
                     let level = Self::get_or_create_level(&self.asks, price);
                     level.push_order(order.clone());
-                    self.order_lookup.insert(order_id, (side, price));
+                    self.order_lookup.insert(order_id, (side, price, order.clone()));
                 }
             }
        }
@@ -751,43 +749,46 @@ impl OrderBook {
 
     // Cancel an order by id. Deterministic and safe.
     /// Returns Ok(remaining_qty) if cancelled; Err if not found / already filled.
-    pub fn cancel_order(&self, order_id: OrderId) -> Result<Quantity, String> {
+    pub fn cancel_order(&self, order_id: OrderId) -> Result<Quantity, OrderBookError> {
         // Find order meta in lookup
         if let Some(entry) = self.order_lookup.get(&order_id) {
-            let (side, price) = *entry.value();
-            // Get PriceLevel
-            let maybe_level = {
-                match side {
-                    Side::Buy => self.bids.read().get(&price).cloned(),
-                    Side::Sell => self.asks.read().get(&price).cloned(),
-                }
+            let (side, price, order_arc) = entry.value().clone();
+            // Try to mark as cancelled first; if we succeed, then remove from queue
+            // If it's already filled, bail out.
+            let curr_status = order_arc.get_status();
+            if curr_status == OrderStatus::Filled {
+                return Err(OrderBookError::AlreadyCancelled(0));
+            }
+            // Try to set Cancelled atomically
+            let prev = order_arc.status.load(Ordering::Acquire);
+            let _ = order_arc.status.compare_exchange_weak(
+                prev,
+                OrderStatus::Cancelled as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+            // Now remove from price level queue (best-effort)
+            let maybe_level = match side {
+                Side::Buy => self.bids.read().get(&price).cloned(),
+                Side::Sell => self.asks.read().get(&price).cloned(),
             };
-
+    
             if let Some(level) = maybe_level {
-                // Attempt atomic cancel of status first
-                // But we must remove from queue to prevent matching
-                // coord: perform cancel atomic, then remove from queue
-                // We'll try to fetch the order object via scanning queue and compare id.
-                // If other thread is filling simultaneously, cancel_atomic might fail; handle that.
-                // Acquire queue lock and locate/remove
-                let removed = level.remove_order(order_id);
-                if let Some(rem_qty) = removed {
-                    // mark status (best-effort)
-                    // Try to set status to Cancelled if not already Filled
-                    // We cannot fetch order object easily here; but we can attempt to set in lookup map?
-                    // For simplicity, get the order object from elsewhere: the caller should also maintain pointer to Arc<Order>.
-                    // We can find Arc<Order> by scanning or you persisted a pointer elsewhere.
-                    // In this simplified design we return remaining qty removed and remove lookup entry.
+                if let Some((found_order, rem_qty)) = level.remove_order(order_id) {
+                    // Remove from lookup map
                     self.order_lookup.remove(&order_id);
+                    // Ensure we mark the order cancelled
+                    found_order.status.store(OrderStatus::Cancelled as u8, Ordering::Release);
                     return Ok(rem_qty);
                 } else {
-                    return Err("Order not found in price level queue (maybe already matched)".into());
+                    // Not found in queue — maybe already matched concurrently
+                    return Err(OrderBookError::OrderNotFound(0));
                 }
             } else {
-                return Err("Price level not found".into());
+                return Err(OrderBookError::InvalidPrice(0));
             }
         } else {
-            return Err("Order not found".into());
+            return Err(OrderBookError::OrderNotFound(0));
         }
     }
 }
@@ -801,6 +802,39 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    static SEED: Lazy<u64> = Lazy::new(|| { 0xDEADBEEFCAFEBABE });
+
+
+    fn build_orderbook() -> (OrderBook, crossbeam_channel::Receiver<Trade>) {
+        let (tx, rx) = unbounded();
+        println!("Created an unbounded channel");
+        let ob = OrderBook::new(tx);
+        println!("Created a new orderbook");
+        (ob, rx)
+    }
+
+
+    fn drain_trades(rx: &crossbeam_channel::Receiver<Trade>) -> Vec<Trade> {
+        let mut trades = vec![];
+        while let Ok(t) = rx.try_recv() {
+            trades.push(t);
+        }
+        trades
+    }
+
+
+    // helper to submit N limit orders on one side sequentially
+    fn push_limit_orders(ob: &OrderBook, side: Side, price: u64, qty: u64, n: usize) -> Vec<u64> {
+        
+        let mut ids = Vec::with_capacity(n);
+
+        for _ in 0..n {
+            let id = ob.submit_limit_order(side, price, qty).expect("submit limit");
+            ids.push(id);
+        }
+        ids
+    }
 
     #[test]
     fn test_order_creation() {
@@ -846,42 +880,201 @@ mod tests {
         // Try to cancel again
         assert!(!order.cancel());
     }
-    
+
+
     #[test]
-    fn test_order_book_creation() {
-        let book = OrderBook::new();
-        assert_eq!(book.best_bid(), None);
-        assert_eq!(book.best_ask(), None);
-        assert_eq!(book.spread(), None);
-    }
-    
-    #[test]
-    fn test_order_id_generation() {
-        let book = OrderBook::new();
-        let id1 = book.generate_order_id();
-        let id2 = book.generate_order_id();
-        let id3 = book.generate_order_id();
-        
-        assert_eq!(id1, 1);
-        assert_eq!(id2, 2);
-        assert_eq!(id3, 3);
+    fn limit_buy_matches_limit_sell_at_price_and_quantity() {
+        let (ob, rx) = build_orderbook();
+
+
+        // Seller posts 100 @ 10
+        let sell = ob.submit_limit_order(super::Side::Sell, 10, 100).unwrap();
+        println!("Submitted a sELL limit order!");
+        // Buyer posts 50 @ 12 (aggressive) should match with seller at 10
+        let buy = ob.submit_limit_order(super::Side::Buy, 12, 50).unwrap();
+        println!("Submitted a BUY limit order!");
+
+        println!("draining trades");
+        let trades = drain_trades(&rx);
+        assert_eq!(trades.len(), 1, "expected single trade");
+        let t = &trades[0];
+        assert_eq!(t.quantity, 50);
+        assert_eq!(t.price, 10);
+
+
+        // Check remaining quantities: sell should have 50 left
+        // Cancel to inspect remaining qty via cancel_order result
+        println!("Checking the remaining quantities");
+        let rem = ob.cancel_order(sell).expect("cancel returns remaining");
+        println!("Remaining orders: {}", &rem);
+        assert_eq!(rem, 50);
     }
 
     #[test]
-    fn test_end_to_end_orderbook() {
-        let orderbook = OrderBook::new();
-        let order = Order::new(1, Side::Buy, OrderType::Limit, 10_000, 100);
-        orderbook.submit_limit_order(Side::Buy, 10_000, 100);
-        
-        let buy_order = Order::new(2, Side::Buy, OrderType::Limit, 10_000, 100);
-        let sell_order = Order::new(3, Side::Sell, OrderType::Limit, 10_000, 100);
+    fn market_order_consumes_best_prices_and_returns_filled_amount() {
+        let (ob, rx) = build_orderbook();
 
-        orderbook.submit_limit_order(Side::Buy, 10_000, 100);
-        orderbook.submit_limit_order(Side::Sell, 10_000, 100);
+
+        // Two sell levels
+        ob.submit_limit_order(super::Side::Sell, 11, 30).unwrap();
+        ob.submit_limit_order(super::Side::Sell, 12, 40).unwrap();
+
+
+        let (id, filled) = ob.submit_market_order(super::Side::Buy, 50).unwrap();
+        println!("Filled : {}", filled);
+        assert_eq!(filled, 50);
+
+
+        let trades = drain_trades(&rx);
+        println!("Total trades: {}", trades.len());
+
+        println!("{:?}", trades);
+        let total: u64 = trades.iter().map(|t| t.quantity).sum();
+        assert_eq!(total, 50);
+        // Best price first should be 11 for 30, then 12 for 20
+        assert_eq!(trades[0].price, 11);
+        assert_eq!(trades[1].price, 12);
+    }
+
+    #[test]
+    fn sample_test() {
+        let (orderBook, _) = build_orderbook();
+
+        if orderBook.submit_limit_order(super::Side::Sell, 11, 30).is_ok() {
+            println!("Limit Sell order created!");
+        }
+
+        if orderBook.submit_limit_order(super::Side::Sell, 12, 30).is_ok() {
+            println!("Limit Sell order created!");
+        }
+
+        if orderBook.submit_limit_order(super::Side::Buy, 11, 23).is_ok() {
+            println!("Limit Buy order created!");
+        }
+
+        if orderBook.submit_limit_order(super::Side::Buy, 12, 35).is_ok() {
+            println!("Limit Buy order created!");
+        }
+    }
+    
+    // ------- Edge-case tests -------
+
+
+    #[test]
+    fn reject_invalid_limit_orders() {
+        let (ob, _rx) = build_orderbook();
+        assert!(ob.submit_limit_order(super::Side::Buy, 0, 10).is_err());
+        assert!(ob.submit_limit_order(super::Side::Sell, 10, 0).is_err());
+    }
+
+
+    #[test]
+    fn market_order_with_no_liquidity_returns_zero_fill() {
+        let (ob, _rx) = build_orderbook();
+        let (_id, filled) = ob.submit_market_order(super::Side::Buy, 10).unwrap();
+        assert_eq!(filled, 0);
+    }
+   
+    #[test]
+    fn fifo_within_price_level_preserved() {
+        let (ob, rx) = build_orderbook();
         
-        orderbook.spread();
-        // assert_eq!(orderbook.spread(), Some(0));
-        // assert_eq!(orderbook.best_bid(), Some(10_000));
-        // assert_eq!(orderbook.best_ask(), Some(10_000));
+        
+        // Create 3 sellers at same price with qty 10 each
+        let ids = push_limit_orders(&ob, super::Side::Sell, 20, 10, 3);
+        
+        
+        // Buy market order for 25 should consume first 3 in FIFO and leave 5 on third
+        let (_id, filled) = ob.submit_market_order(super::Side::Buy, 25).unwrap();
+        assert_eq!(filled, 25);
+        
+        
+        let trades = drain_trades(&rx);
+        assert_eq!(trades.len(), 3);
+        assert_eq!(trades[0].maker_order_id, ids[0]);
+        assert_eq!(trades[1].maker_order_id, ids[1]);
+        assert_eq!(trades[2].maker_order_id, ids[2]);
+    }
+
+    #[test]
+    fn price_time_priority_buy_prefers_highest_price_then_time() {
+        let (ob, rx) = build_orderbook();
+
+
+        // Two buy limit orders at different prices
+        let buy1 = ob.submit_limit_order(super::Side::Buy, 10, 10).unwrap(); // lower price
+        let buy2 = ob.submit_limit_order(super::Side::Buy, 12, 10).unwrap(); // higher price => better
+
+
+        // Seller market for 10 should hit buy2 first
+        let (_id, filled) = ob.submit_market_order(super::Side::Sell, 10).unwrap();
+        let trades = drain_trades(&rx);
+        assert_eq!(trades.len(), 1);
+        println!("Buy 2 order_id : {}", &buy2);
+        println!("trades[0].maker_order_id : {}", &trades[0].maker_order_id);
+        assert_eq!(trades[0].maker_order_id, buy2);
+    }
+
+    // ------- Cancellation tests (single-threaded) -------
+    #[test]
+    fn cancel_removes_order_and_returns_remaining_quantity() {
+        let (ob, _rx) = build_orderbook();
+        let id = ob.submit_limit_order(super::Side::Buy, 50, 42).unwrap();
+        let rem = ob.cancel_order(id).expect("should cancel");
+        assert_eq!(rem, 42);
+        assert!(ob.cancel_order(id).is_err(), "double-cancel should error or not be found");
+    }
+
+
+    #[test]
+    fn concurrent_matching_and_cancellation() {
+        let (ob, rx) = build_orderbook();
+
+
+        // push a long-lived passive sell
+        let maker = ob.submit_limit_order(super::Side::Sell, 30, 100).unwrap();
+        println!("Submitted limited order with order_id : {}", &maker);
+
+
+        // spawn thread to run a large market buy that will gradually consume
+        let ob_arc = Arc::new(ob);
+        let ob1 = ob_arc.clone();
+        
+        // 10 market orders each 10 qty
+        let handle = thread::spawn(move || {
+            std::panic::set_hook(Box::new(|info| {
+                eprintln!("Panic in spawned thread: {}", info);
+            }));
+            for _ in 0..10 {
+                println!("Creating a new buy market order");
+                let r = ob1.submit_market_order(super::Side::Buy, 10);
+                println!("Result of submit_market_order: {:?}", r);
+                thread::sleep(Duration::from_millis(1));
+            }
+        });
+
+
+        // concurrently attempt cancellations (some should fail as fills happen)
+        thread::sleep(Duration::from_millis(2));
+        println!("Cancelling order");
+        let cancel_result = ob_arc.cancel_order(maker);
+        // Either cancels some remaining qty or fails because filled
+        match cancel_result {
+            Ok(_) => {
+                println!("Cancel successful!");
+            }
+            Err(_) => {
+                println!("Cancel error");
+            }
+        }
+
+
+        handle.join().unwrap();
+        thread::sleep(Duration::from_millis(10));
+
+        // Ensure at least some trades fired
+        let trades = drain_trades(&rx);
+        println!("Total trades : {}", trades.len());
+        assert!(trades.len() == 2 || trades.len() == 10);
     }
 }

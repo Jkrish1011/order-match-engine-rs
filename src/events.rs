@@ -1,5 +1,6 @@
 use crate::types::*;
 
+#[derive(Debug)]
 pub struct Trade {
     pub taker_order_id: OrderId,
     pub maker_order_id: OrderId,
