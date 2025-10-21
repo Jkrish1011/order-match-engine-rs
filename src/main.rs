@@ -750,47 +750,55 @@ impl OrderBook {
     // Cancel an order by id. Deterministic and safe.
     /// Returns Ok(remaining_qty) if cancelled; Err if not found / already filled.
     pub fn cancel_order(&self, order_id: OrderId) -> Result<Quantity, OrderBookError> {
-        // Find order meta in lookup
-        if let Some(entry) = self.order_lookup.get(&order_id) {
-            let (side, price, order_arc) = entry.value().clone();
-            // Try to mark as cancelled first; if we succeed, then remove from queue
-            // If it's already filled, bail out.
-            let curr_status = order_arc.get_status();
-            if curr_status == OrderStatus::Filled {
-                return Err(OrderBookError::AlreadyCancelled(0));
-            }
-            // Try to set Cancelled atomically
-            let prev = order_arc.status.load(Ordering::Acquire);
-            let _ = order_arc.status.compare_exchange_weak(
-                prev,
-                OrderStatus::Cancelled as u8,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            );
-            // Now remove from price level queue (best-effort)
-            let maybe_level = match side {
-                Side::Buy => self.bids.read().get(&price).cloned(),
-                Side::Sell => self.asks.read().get(&price).cloned(),
-            };
+        // extract the lookup tuple and drop the DashMap guard immediately 
+        let (side, price, order_arc) = {
+            // limit scope of the DashMap guard so it is dropped at the end of this block
+            let entry = self
+                .order_lookup
+                .get(&order_id)
+                .ok_or(OrderBookError::OrderNotFound(order_id))?;
+            entry.value().clone()
+        }; // DashMap guard dropped here
     
-            if let Some(level) = maybe_level {
-                if let Some((found_order, rem_qty)) = level.remove_order(order_id) {
-                    // Remove from lookup map
-                    self.order_lookup.remove(&order_id);
-                    // Ensure we mark the order cancelled
-                    found_order.status.store(OrderStatus::Cancelled as u8, Ordering::Release);
-                    return Ok(rem_qty);
-                } else {
-                    // Not found in queue — maybe already matched concurrently
-                    return Err(OrderBookError::OrderNotFound(0));
-                }
+        // attempt to mark the order as cancelled atomically
+        // Try a CAS from Active/PartiallyFilled -> Cancelled.
+        // If it's already Filled, return an error.
+        let curr_status = order_arc.get_status();
+        if curr_status == OrderStatus::Filled {
+            return Err(OrderBookError::AlreadyCancelled(order_id));
+        }
+    
+        // Best-effort CAS to Cancelled. It may fail if a filler raced and changed status.
+        // We don't treat CAS failure as fatal here; we'll inspect the queue and remaining quantity.
+        let _ = order_arc.status.compare_exchange_weak(
+            curr_status as u8,
+            OrderStatus::Cancelled as u8,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    
+        // find price level and remove the order from the level queue
+        let maybe_level = match side {
+            Side::Buy => self.bids.read().get(&price).cloned(),
+            Side::Sell => self.asks.read().get(&price).cloned(),
+        };
+    
+        if let Some(level) = maybe_level {
+            if let Some((found_order, rem_qty)) = level.remove_order(order_id) {
+                // Remove from lookup map (safe now)
+                self.order_lookup.remove(&order_id);
+                // Ensure the order status is set to Cancelled (idempotent)
+                found_order.status.store(OrderStatus::Cancelled as u8, Ordering::Release);
+                return Ok(rem_qty);
             } else {
-                return Err(OrderBookError::InvalidPrice(0));
+                // Not found in queue — possibly already being matched by another thread
+                return Err(OrderBookError::OrderNotFound(order_id));
             }
         } else {
-            return Err(OrderBookError::OrderNotFound(0));
+            return Err(OrderBookError::InvalidPrice(price));
         }
     }
+    
 }
 
 
@@ -1076,5 +1084,79 @@ mod tests {
         let trades = drain_trades(&rx);
         println!("Total trades : {}", trades.len());
         assert!(trades.len() == 2 || trades.len() == 10);
+    }
+
+
+    #[test]
+    fn crossing_limit_orders_create_trades_and_leave_remainders() {
+        let (ob, rx) = build_orderbook();
+
+
+        // Seller posts at 10, Buyer posts at 12 -> crossing should execute at maker price (10)
+        let sell = ob.submit_limit_order(super::Side::Sell, 10, 100).unwrap();
+        let buy = ob.submit_limit_order(super::Side::Buy, 12, 60).unwrap();
+
+
+        let trades = drain_trades(&rx);
+        assert_eq!(trades.len(), 1);
+        assert_eq!(trades[0].quantity, 60);
+        assert_eq!(trades[0].price, 10);
+
+        println!("Trades: {:?}", &trades);
+
+
+        // Seller should have 40 left
+        let left = ob.cancel_order(sell).unwrap();
+        assert_eq!(left, 40);
+    }
+
+    #[test]
+    fn crossing_limit_orders_and_leave_remainders_2() {
+        let (orderbook, rx) = build_orderbook();
+
+        let buy =  orderbook.submit_limit_order(super::Side::Buy, 20, 100).unwrap();
+        let sell = orderbook.submit_limit_order(super::Side::Sell, 20, 120).unwrap();
+
+        let (market_order_id, market_order_qty) = orderbook.submit_market_order(super::Side::Buy, 30).unwrap();
+
+        // let left = orderbook.cancel_order(market_order_id).unwrap();
+
+        println!("Left over: {}", 30 - market_order_qty);
+        let trades = drain_trades(&rx);
+        println!("trades : {:?}", trades);
+    }
+
+    #[test]
+    fn multithreaded_stress_test_small_scale() {
+        let (ob, rx) = build_orderbook();
+        let ob = Arc::new(ob);
+
+
+        let n_threads = 8;
+        let orders_per_thread = 200;
+        let mut handles = Vec::new();
+
+
+        for i in 0..n_threads {
+            let obc = ob.clone();
+            handles.push(thread::spawn(move || {
+                let mut rng = StdRng::seed_from_u64(*SEED + i as u64);
+                for _ in 0..orders_per_thread {
+                    if rng.gen_bool(0.5) {
+                    let _ = obc.submit_limit_order(super::Side::Buy, 50 + (rng.gen_range(0..10)), 1 + rng.gen_range(0..5));
+                    } else {
+                    let _ = obc.submit_limit_order(super::Side::Sell, 40 + (rng.gen_range(0..10)), 1 + rng.gen_range(0..5));
+                    }
+                }
+            }));
+        }
+
+        for h in handles { h.join().unwrap(); }
+
+        // Let any trades flush
+        thread::sleep(Duration::from_millis(50));
+        let trades = drain_trades(&rx);
+        // Basic invariant: no negative quantities
+        for t in &trades { assert!(t.quantity > 0); }
     }
 }
