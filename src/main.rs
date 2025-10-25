@@ -1143,9 +1143,9 @@ mod tests {
                 let mut rng = StdRng::seed_from_u64(*SEED + i as u64);
                 for _ in 0..orders_per_thread {
                     if rng.gen_bool(0.5) {
-                    let _ = obc.submit_limit_order(super::Side::Buy, 50 + (rng.gen_range(0..10)), 1 + rng.gen_range(0..5));
+                        let _ = obc.submit_limit_order(super::Side::Buy, 50 + (rng.gen_range(0..10)), 1 + rng.gen_range(0..5));
                     } else {
-                    let _ = obc.submit_limit_order(super::Side::Sell, 40 + (rng.gen_range(0..10)), 1 + rng.gen_range(0..5));
+                        let _ = obc.submit_limit_order(super::Side::Sell, 40 + (rng.gen_range(0..10)), 1 + rng.gen_range(0..5));
                     }
                 }
             }));
@@ -1159,4 +1159,22 @@ mod tests {
         // Basic invariant: no negative quantities
         for t in &trades { assert!(t.quantity > 0); }
     }
+
+    #[test]
+    fn throughput_smoke() {
+        let (ob, _rx) = build_orderbook();
+        let ob = Arc::new(ob);
+
+        let n = 500_000u64;
+        let start = Instant::now();
+        println!(" start : {:?}", &start);
+        for i in 0..n {
+            let _ = ob.submit_limit_order(super::Side::Buy, 100 + (i % 10), 1);
+        }
+        let elapsed = start.elapsed();
+        println!(" elapsed : {:?}", &elapsed);
+        // sanity: ensure it completes quickly in test environment
+        assert!(elapsed.as_secs() < 5, "too slow: {:?}", elapsed);
+    }
+
 }
