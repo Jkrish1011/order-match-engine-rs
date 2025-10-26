@@ -1251,6 +1251,28 @@ mod tests {
         assert_eq!(t.maker_order_id, sell);
         assert!(t.timestamp > 0);
     }
+
+    #[test]
+    fn deterministic_sequence_reproducibility() {
+        let (ob1, rx1) = build_orderbook();
+        let (ob2, rx2) = build_orderbook();
+
+        let mut rng1 = StdRng::seed_from_u64(*SEED);
+        let mut rng2 = StdRng::seed_from_u64(*SEED);
+
+
+        for _ in 0..200 {
+            let price = rng1.gen_range(1..200);
+            let qty = rng1.gen_range(1..150);
+            ob1.submit_limit_order(super::Side::Buy, price, qty).unwrap();
+
+            let price2 = rng2.gen_range(1..200);
+            let qty2 = rng2.gen_range(1..150);
+            ob2.submit_limit_order(super::Side::Buy, price2, qty2).unwrap();
+        }
+
+        assert_eq!(ob1.total_quantity(), ob2.total_quantity());
+    }
 }
 
 
