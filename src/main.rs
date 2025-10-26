@@ -480,7 +480,7 @@ impl OrderBook {
             Side::Sell => {
                 // Symmetric. But read through bids in descending order
                 let bids_read = self.bids.read();
-                let mut candidate_prices: Vec<Price> = bids_read.keys().cloned().collect();
+                let mut candidate_prices: Vec<Price> = bids_read.range(price..).map(|(p, _)| *p).collect();
                 drop(bids_read);
 
                 candidate_prices.sort_by(|a,b| b.cmp(a)); // sort in descending order
@@ -1177,4 +1177,80 @@ mod tests {
         assert!(elapsed.as_secs() < 5, "too slow: {:?}", elapsed);
     }
 
+    #[test]
+    fn randomized_fuzz_like_sequence() {
+        let (ob, rx) = build_orderbook();
+        let ob = Arc::new(ob);
+        let mut rng = StdRng::seed_from_u64(*SEED);
+
+        let mut placed = Vec::new();
+
+        for _ in 0..1000 {
+            let side = if rng.gen_bool(0.5) { super::Side::Buy } else { super::Side::Sell };
+            if rng.gen_bool(0.7) {
+                let price = rng.gen_range(1..200);
+                let qty = rng.gen_range(1..10);
+                let id = ob.submit_limit_order(side, price, qty).unwrap();
+                placed.push(id);
+            } else {
+                let qty = rng.gen_range(1..20);
+                let _ = ob.submit_market_order(side, qty).unwrap();
+            }
+            // occasionally cancel a random order
+            if !placed.is_empty() && rng.gen_bool(0.02) {
+                let idx = rng.gen_range(0..placed.len());
+                let id = placed.remove(idx);
+                let _ = ob.cancel_order(id);
+            }
+        }
+
+        // Basic invariant checks
+        for t in drain_trades(&rx) { assert!(t.quantity > 0); }
+    }
+
+    #[test]
+    fn invariant_hold_after_random_opts() {
+        let (ob, _rx) = build_orderbook();
+        let ob = Arc::new(ob);
+
+        // Random limit orders
+        ob.submit_limit_order(super::Side::Buy, 100, 10).unwrap();
+        ob.submit_limit_order(super::Side::Sell, 200, 20).unwrap();
+
+        let tb = ob.total_bid_quantity();
+        let ta = ob.total_ask_quantity();
+        println!("tb : {:?}", &tb);
+        println!("ta : {:?}", &ta);
+        
+        // Verify orders are in the book
+        assert!(tb > 0);
+        assert!(ta > 0);
+
+        // Spread should be positive (ask > bid)
+        let spread_val = ob.spread().unwrap();
+        println!("spread_val : {:?}", &spread_val);
+        assert!(spread_val > 0);
+        
+        // Verify no trades occurred since orders don't cross
+        let trades = drain_trades(&_rx);
+        println!("trades : {:?}", &trades);
+        assert_eq!(trades.len(), 0, "Orders at 100 and 200 don't cross, so no trades expected");
+    }
+
+    #[test]
+    fn trades_emitted_match_expected_shape_and_timestamps() {
+        let (ob, rx) = build_orderbook();
+        
+        let sell = ob.submit_limit_order(super::Side::Sell, 42, 5).unwrap();
+        let _ = ob.submit_market_order(super::Side::Buy, 5).unwrap();
+        
+        
+        let trades = drain_trades(&rx);
+        assert_eq!(trades.len(), 1);
+        let t = &trades[0];
+        assert_eq!(t.maker_order_id, sell);
+        assert!(t.timestamp > 0);
+    }
 }
+
+
